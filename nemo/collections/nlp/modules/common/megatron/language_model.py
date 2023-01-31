@@ -217,7 +217,7 @@ class Embedding(MegatronModule):
         use_cpu_initialization=False,
         fp32_residual_connection=False,
         sequence_parallel=False,
-        position_embedding_type='learned_absolute',
+        position_embedding_type=None,
         transpose_batch_sequence=True,
     ):
         super(Embedding, self).__init__()
