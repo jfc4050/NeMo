@@ -180,6 +180,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             bias_activation_fusion=self.cfg.get('bias_activation_fusion', True),
             bias_dropout_add_fusion=self.cfg.get('bias_dropout_add_fusion', True),
             masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
+            use_flash_attention=self.cfg.get('flash_attention', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
             sequence_parallel=self.cfg.get('sequence_parallel', False),
