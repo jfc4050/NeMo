@@ -23,7 +23,13 @@ from nemo.collections.nlp.modules.common.megatron.fused_softmax import MatchedSc
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import apply_rotary_pos_emb
 from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, attention_mask_func
+from nemo.collections.nlp.modules.common.megatron.flash_attn_triton import flash_attn_func
 from nemo.core import adapter_mixins
+
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 try:
     from apex.transformer import parallel_state, tensor_parallel
@@ -53,6 +59,51 @@ except (ImportError, ModuleNotFoundError):
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
+
+class FlashSelfAttention(torch.nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
+                 sequence_parallel=False, device=None, dtype=None):
+        super().__init__()
+        assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+        self.sequence_parallel = sequence_parallel
+
+    def forward(self, q, k, v, attention_mask=None):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+            attention_mask: The tensor containing attention mask
+        """
+        if attention_mask is not None:
+            attention_mask = attention_mask.view(q.shape[0], -1)
+            attention_mask = attention_mask[:, None, None, :]
+            attention_mask = attention_mask.to(q.dtype)
+        if not self.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                output = flash_attn_func(
+                    q, k, v, attention_mask, self.causal,
+                    self.dropout_p if self.training else 0.0,
+                    self.softmax_scale
+                )
+        else:
+            output = flash_attn_func(
+                q, k, v, attention_mask, self.causal,
+                self.dropout_p if self.training else 0.0,
+                self.softmax_scale
+            )
+        return output
 
 
 class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
@@ -87,9 +138,9 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         sequence_parallel=False,
         gradient_accumulation_fusion=False,
         normalize_attention_scores=True,
+        use_flash_attention=True,
     ):
         super(ParallelAttention, self).__init__()
-
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
@@ -100,6 +151,11 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         self.megatron_legacy = megatron_legacy
 
         self.set_accepted_adapter_types([InfusedAdapterConfig._target_])
+
+        self.use_flash_attention = use_flash_attention
+        if self.use_flash_attention:
+            if rearrange is None:
+                raise ImportError('einops is not installed, please install with pip install einops')
 
         if kv_channels is None:
             assert (
@@ -172,6 +228,13 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             sequence_parallel=sequence_parallel,
             normalize_attention_scores=normalize_attention_scores,
         )
+
+        if self.use_flash_attention:
+            self.core_attention_flash = FlashSelfAttention(
+                causal=(self.attn_mask_type == AttnMaskType.causal),
+                attention_dropout=attention_dropout,
+                sequence_parallel=sequence_parallel
+            )
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -438,28 +501,45 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         if get_key_value:
             present = (key_layer, value_layer)
 
-        if checkpoint_core_attention:
-            context_layer = self._checkpointed_attention_forward(
-                query_layer,
-                key_layer,
-                value_layer,
-                attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                relative_position_bias=relative_position_bias,
-                headscale_tensor=self.head_scale_tensor if self.headscale else None,
-            )
+        if not self.use_flash_attention:
+            if checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    relative_position_bias=relative_position_bias,
+                    headscale_tensor=self.head_scale_tensor if self.headscale else None,
+                )
+            else:
+                context_layer = self.core_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    attention_mask,
+                    layer_past=layer_past,
+                    get_key_value=get_key_value,
+                    rotary_pos_emb=rotary_pos_emb,
+                    relative_position_bias=relative_position_bias,
+                    headscale_tensor=self.head_scale_tensor if self.headscale else None,
+                )
+
         else:
-            context_layer = self.core_attention(
-                query_layer,
-                key_layer,
-                value_layer,
-                attention_mask,
-                layer_past=layer_past,
-                get_key_value=get_key_value,
-                rotary_pos_emb=rotary_pos_emb,
-                relative_position_bias=relative_position_bias,
-                headscale_tensor=self.head_scale_tensor if self.headscale else None,
-            )
+            if self.headscale or \
+                layer_past is not None or \
+                rotary_pos_emb is not None or \
+                relative_position_bias is not None:
+                raise NotImplementedError(
+                    "headscale/layer_past/rotary_pos_emb/relative_position_bias are not implemented for triton flash attention."
+                )
+            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            if self.attention_type == AttnType.self_attn:
+                context_layer = self.core_attention_flash(q, k, v)
+            else:
+                context_layer = self.core_attention_flash(q, k, v, attention_mask)
+            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
         # Output. [sq, b, h]
@@ -660,7 +740,6 @@ class CoreAttention(MegatronModule):
     ):
 
         super(CoreAttention, self).__init__()
-
         self.precision = precision
         self.fp16 = precision == 16
         self.bf16 = precision == 'bf16'

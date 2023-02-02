@@ -201,6 +201,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             share_embeddings_and_output_weights=self.cfg.get('share_embeddings_and_output_weights', True),
             attention_type=self.cfg.get('attention_type', 'multihead'),
             masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
+            use_flash_attention=self.cfg.get('flash_attention', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
             sequence_parallel=self.cfg.get('sequence_parallel', False),

@@ -107,7 +107,7 @@ model:
   bias_activation_fusion: True # Use a kernel that fuses the bias addition from weight matrices with the subsequent activation function.
   bias_dropout_add_fusion: True # Use a kernel that fuses the bias addition, dropout and residual connection addition.
   masked_softmax_fusion: True # Use a kernel that fuses the attention softmax with it's mask.
-
+  flash_attention: True # Use triton based flash attention
 
   # Miscellaneous
   seed: 1234
