@@ -1,7 +1,9 @@
 """
 *Experimental* implementation of FlashAttention in Triton.
+
 We use the FlashAttention implementation from Phil Tillet a starting point.
 https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
+
 Changes:
 - Implement both causal and non-causal attention.
 - Implement both self-attention and cross-attention.
@@ -12,6 +14,7 @@ Changes:
 - Make the backward for d=128 much faster by reducing register spilling.
 - Optionally parallelize the backward pass across seqlen_k, to deal with the case of
 small batch size * nheads.
+
 Caution:
 - This is an *experimental* implementation. The forward pass should be quite robust but
 I'm not 100% sure that the backward pass doesn't have race conditions (due to the Triton compiler).
@@ -21,6 +24,7 @@ I'm not 100% sure that the backward pass doesn't have race conditions (due to th
 "test_flash_attn_triton_race_condition". I've tested and fixed many race conditions
 for different head dimensions (40, 48, 64, 128, 80, 88, 96), but I'm still not 100% confident
 that there are none left for other head dimensions.
+
 Differences between this Triton version and the CUDA version:
 - Triton version doesn't support dropout.
 - Triton forward is generally faster than CUDA forward, while Triton backward is
@@ -40,7 +44,7 @@ import triton.language as tl
 
 @triton.jit
 def make_dropout_mask(dropout_p, dropout_seed, indices):
-    return tl.rand(dropout_seed, indices, 5) > dropout_p
+    return tl.rand(dropout_seed, indices, 3) > dropout_p
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
@@ -328,7 +332,14 @@ def _bwd_kernel_one_col_block(
     do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
     dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
     if BIAS_TYPE == 'vector':
+        # vector bias is same over all values of m, so
+        # can be loaded once and kept in SRAM over all iterations
         b_ptrs = Bias + offs_n
+        if EVEN_N:
+            bias = tl.load(b_ptrs).to(tl.float32)
+        else:
+            bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
+        bias = bias[None, :]
     elif BIAS_TYPE == 'matrix':
         b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
     # initialize dv and dk
@@ -388,11 +399,7 @@ def _bwd_kernel_one_col_block(
         if BIAS_TYPE != 'none':
             tl.debug_barrier()  # Race condition otherwise
             if BIAS_TYPE == 'vector':
-                if EVEN_N:
-                    bias = tl.load(b_ptrs).to(tl.float32)
-                else:
-                    bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
-                bias = bias[None, :]
+                pass  # already loaded before entering loop
             elif BIAS_TYPE == 'matrix':
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
@@ -814,6 +821,7 @@ def increment_philox_state(increment: int) -> tuple:
     1. extract the current rng seed and offset
     2. increment the offset
     3. then set the new state
+
     layout of state tensor is as follows:
     [states (200 * 4bytes), seed (uint64_t - 8 bytes), offset (uint64_t - 8 bytes)]
     see https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
