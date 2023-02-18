@@ -539,6 +539,13 @@ class TransformerLanguageModel(MegatronModule):
                 rotary_dim = int(rotary_dim * rotary_percentage)
             self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
 
+        if position_embedding_type == 'rope':
+            rotary_dim = self.hidden_size // num_attention_heads if kv_channels is None else kv_channels
+            assert 0 < rotary_percentage <= 1
+            if rotary_percentage < 1:
+                rotary_dim = int(rotary_dim * rotary_percentage)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+
         # Transformer.
         self.encoder = ParallelTransformer(
             init_method=self.init_method,

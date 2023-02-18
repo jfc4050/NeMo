@@ -146,6 +146,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
+        position_embedding_type='learned_absolute',
+        multi_query_attention=False,
         headscale=False,
         activations_checkpoint_granularity=None,
         sequence_parallel=False,
@@ -166,6 +168,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.layer_type = layer_type
         self.bias = bias
         self.transformer_block_type = transformer_block_type
+        self.position_embedding_type = position_embedding_type
         self.set_accepted_adapter_types([LinearAdapterConfig._target_, ParallelLinearAdapterConfig._target_])
 
         if not bias and bias_dropout_add_fusion:
@@ -216,11 +219,13 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 masked_softmax_fusion=masked_softmax_fusion,
                 use_flash_attention=use_flash_attention,
                 attention_dropout=attention_dropout,
+                multi_query_attention=multi_query_attention,
                 layer_type=layer_type,
                 megatron_legacy=megatron_legacy,
                 bias=bias,
                 headscale=headscale,
                 activations_checkpoint_granularity=activations_checkpoint_granularity,
+                position_embedding_type=position_embedding_type,
                 sequence_parallel=sequence_parallel,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 normalize_attention_scores=normalize_attention_scores,
@@ -279,6 +284,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 precision=precision,
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                 kv_channels=kv_channels,
+                multi_query_attention=multi_query_attention,
                 use_cpu_initialization=use_cpu_initialization,
                 masked_softmax_fusion=masked_softmax_fusion,
                 use_flash_attention=use_flash_attention,
@@ -639,6 +645,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
+        position_embedding_type='learned_absolute',
+        multi_query_attention=False,
         headscale=False,
         activations_checkpoint_granularity=None,
         sequence_parallel=False,
@@ -679,7 +687,9 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             chunk_size=chunk_size,
             normalization=normalization,
             transformer_block_type=transformer_block_type,
+            position_embedding_type=position_embedding_type,
             headscale=headscale,
+            multi_query_attention=multi_query_attention,
             activations_checkpoint_granularity=activations_checkpoint_granularity,
             sequence_parallel=sequence_parallel,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -889,6 +899,7 @@ class ParallelTransformer(MegatronModule):
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
+        position_embedding_type='learned_absolute',
         headscale=False,
         layer_number_offset=0,  # this is use only for attention norm_factor scaling
         activations_checkpoint_granularity=None,
@@ -905,6 +916,7 @@ class ParallelTransformer(MegatronModule):
         reduce_amax=True,
         use_emha=False,
         normalize_attention_scores=True,
+        multi_query_attention=False,
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
@@ -926,6 +938,8 @@ class ParallelTransformer(MegatronModule):
         self.normalization = normalization
         self.transformer_block_type = transformer_block_type
         self.layer_type = layer_type
+        self.position_embedding_type = position_embedding_type
+        self.multi_query_attention = multi_query_attention
 
         self.activations_checkpoint_method = activations_checkpoint_method
         self.activations_checkpoint_num_layers = activations_checkpoint_num_layers
@@ -1066,6 +1080,7 @@ class ParallelTransformer(MegatronModule):
                     use_flash_attention=use_flash_attention,
                     gradient_accumulation_fusion=gradient_accumulation_fusion,
                     persist_layer_norm=persist_layer_norm,
+                    position_embedding_type=position_embedding_type,
                     openai_gelu=openai_gelu,
                     onnx_safe=onnx_safe,
                     activation=activation,
