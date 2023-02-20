@@ -74,9 +74,6 @@ def post_language_model_processing(
         return output.transpose(0, 1).contiguous()
     else:
         # [b s] -> [s b]
-        labels = labels[..., 1:]
-        output = output.transpose(0, 1)[..., :-1, :].transpose(1, 0).contiguous()
-
         labels = labels.transpose(0, 1).contiguous()
 
         if fp16_lm_cross_entropy:
@@ -87,7 +84,7 @@ def post_language_model_processing(
 
         # [s b] -> [b, s]
         loss = loss.transpose(0, 1).contiguous()
-        loss = torch.cat([loss, torch.zeros_like(loss[:, -1:])], axis=-1)
+
         if return_logits:
             return loss, output
         else:
