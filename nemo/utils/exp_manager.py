@@ -48,6 +48,10 @@ from nemo.utils.exceptions import NeMoBaseException
 from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.lightning_logger_patch import add_filehandlers_to_pl_logger
 from nemo.utils.model_utils import inject_model_parallel_rank, uninject_model_parallel_rank
+try:
+    from mstar.utils.lightning import MStarEKSLogger
+except (ImportError, ModuleNotFoundError):
+    MStarEKSLogger = MLFlowLogger
 
 
 class NotFoundError(NeMoBaseException):
@@ -95,13 +99,14 @@ class MLFlowParams:
     experiment_name: Optional[str] = None
     # no run_name because it's set by version
     # local or remote tracking seerver. If tracking_uri is not set, it defaults to save_dir
-    tracking_uri: Optional[str] = None
+    # tracking_uri: Optional[str] = None
     tags: Optional[Dict[str, Any]] = None
-    save_dir: Optional[str] = "./mlruns"
-    prefix: str = ""
-    artifact_location: Optional[str] = None
+    run_name: Optional[str] = "test_runs"
+    # save_dir: Optional[str] = "./mlruns"
+    # prefix: str = ""
+    # artifact_location: Optional[str] = None
     # provide run_id if resuming a previously started run
-    run_id: Optional[str] = None
+    # run_id: Optional[str] = None
 
 
 @dataclass
@@ -781,10 +786,10 @@ def configure_loggers(
         logging.info("WandBLogger has been set up")
 
     if create_mlflow_logger:
-        mlflow_logger = MLFlowLogger(run_name=version, **mlflow_kwargs)
+        mlflow_logger = MStarEKSLogger(**mlflow_kwargs)
 
         logger_list.append(mlflow_logger)
-        logging.info("MLFlowLogger has been set up")
+        logging.info("MStarEKSLogger has been set up")
 
     if create_dllogger_logger:
         dllogger_logger = DLLogger(**dllogger_kwargs)
