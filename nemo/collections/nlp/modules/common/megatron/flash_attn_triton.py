@@ -42,9 +42,19 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def make_dropout_mask(dropout_p, dropout_seed, indices):
-    return tl.rand(dropout_seed, indices, 3) > dropout_p
+    """integer hashing function rather than using philox PRNG. ends up being a lot faster
+    see http://burtleburtle.net/bob/hash/integer.html
+    """
+    a = indices.to(tl.uint32, bitcast=True)
+    a ^= dropout_seed.to(tl.uint32)  # to introduce dependency on seed
+    a ^= a >> 4
+    a = (a ^ 0xdeadbeef) + (a << 5)
+    a ^= (a >> 11)
+
+    return a > (dropout_p * 4294967295).to(tl.uint32)
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
@@ -94,27 +104,30 @@ def _fwd_kernel(
     # off_hb = off_b * nheads + off_h
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
     # I'm seeing a tiny bit of difference (5-7us)
-    q_ptrs = Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    if BIAS_TYPE == 'vector':
-        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n
-    elif BIAS_TYPE == 'matrix':
-        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + (offs_m[:, None] * stride_bm + offs_n[None, :])
+    Q = Q + off_b * stride_qb + off_h * stride_qh
+    K = K + off_b * stride_kb + off_h * stride_kh
+    V = V + off_b * stride_vb + off_h * stride_vh
+    Out = Out + off_b * stride_ob + off_h * stride_oh
+    TMP = TMP + off_hb * seqlen_q_rounded
+    Lse = Lse + off_hb * seqlen_q_rounded
+    if BIAS_TYPE != 'none':
+        Bias = Bias + off_b * stride_bb + off_h * stride_bh
+    if USE_DROPOUT:
+        dropout_rng_offset_hb = rng_offset.to(off_hb.dtype) + (off_hb * seqlen_q * seqlen_k)
+
     # initialize pointer to m and l
-    t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
     # load q: it will stay in SRAM throughout
     # [2022-10-30] TD: Triton bug - in the case of EVEN_M=True and EVEN_N=False, if we just call
     # tl.load(q_ptrs), we get the wrong output!
+    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
     if EVEN_M & EVEN_N:
         if EVEN_HEADDIM:
             q = tl.load(q_ptrs)
@@ -127,47 +140,48 @@ def _fwd_kernel(
             q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                         other=0.0)
 
-    dropout_rng_offset_hb = rng_offset.to(off_hb.dtype) + (off_hb * seqlen_q * seqlen_k)
-
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n_iter = start_n + tl.arange(0, BLOCK_N)
         # -- compute qk ----
+        k_ptrs = K + (offs_n_iter[:, None] * stride_kn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn)
+                k = tl.load(k_ptrs)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0.0)
+                k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=(start_n + offs_n)[:, None] < seqlen_k,
-                            other=0.0)
+                k = tl.load(k_ptrs, mask=offs_n_iter[:, None] < seqlen_k, other=0.0)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn,
-                            mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                k = tl.load(k_ptrs,
+                            mask=(offs_n_iter[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k, trans_b=True)
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
+            qk += tl.where(offs_n_iter[None, :] < seqlen_k, 0, float("-inf"))
         if IS_CAUSAL:
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+            qk += tl.where(offs_m[:, None] >= offs_n_iter[None, :], 0, float("-inf"))
         if BIAS_TYPE != 'none':
             if BIAS_TYPE == 'vector':
+                b_ptrs = Bias + offs_n_iter
                 if EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                    bias = tl.load(b_ptrs).to(tl.float32)
                 else:
-                    bias = tl.load(b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
+                    bias = tl.load(b_ptrs, mask=offs_n_iter < seqlen_k, other=0.0).to(tl.float32)
                 bias = bias[None, :]
             elif BIAS_TYPE == 'matrix':
+                b_ptrs = Bias + (offs_m[:, None] * stride_bm + offs_n_iter[None, :])
                 if EVEN_M & EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                    bias = tl.load(b_ptrs).to(tl.float32)
                 else:
-                    bias = tl.load(b_ptrs + start_n,
+                    bias = tl.load(b_ptrs,
                                    mask=(offs_m[:, None] < seqlen_q)
-                                        & ((start_n + offs_n)[None, :] < seqlen_k),
+                                        & (offs_n_iter[None, :] < seqlen_k),
                                    other=0.0).to(tl.float32)
             # Slightly faster to multiply the softmax_scale in the tl.exp below since the compiler
             # can then fuse the mult and add into an fma instruction. But if we have bias we need to
@@ -185,34 +199,30 @@ def _fwd_kernel(
 
         # # -- update output accumulator --
         # BUG: have to store and immediately load
+        t_ptrs = TMP + offs_m
         tl.store(t_ptrs, acc_o_scale)
         acc_o_scale = tl.load(t_ptrs)
         acc_o = acc_o * acc_o_scale[:, None]
 
         # apply dropout
         if USE_DROPOUT:
-            indices = \
-                dropout_rng_offset_hb + \
-                (offs_m * seqlen_k)[:, None] + \
-                (start_n + offs_n)[None, :]
-
-            # attn matrix has shape (B * H, seqlen_q, seqlen_k)
+            indices = dropout_rng_offset_hb + (offs_m[:, None] * seqlen_k + offs_n_iter[None, :])
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
-            p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
+            p *= tl.where(dropout_mask, 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
+        v_ptrs = V + (offs_n_iter[:, None] * stride_vn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
-                v = tl.load(v_ptrs + start_n * stride_vn)
+                v = tl.load(v_ptrs)
             else:
-                v = tl.load(v_ptrs + start_n * stride_vn, mask=offs_d[None, :] < headdim, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                v = tl.load(v_ptrs + start_n * stride_vn, mask=(start_n + offs_n)[:, None] < seqlen_k,
-                            other=0.0)
+                v = tl.load(v_ptrs, mask=offs_n_iter[:, None] < seqlen_k, other=0.0)
             else:
-                v = tl.load(v_ptrs + start_n * stride_vn,
-                            mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                v = tl.load(v_ptrs,
+                            mask=(offs_n_iter[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         p = p.to(v.dtype)
         acc_o += tl.dot(p, v)
@@ -224,6 +234,7 @@ def _fwd_kernel(
 
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
+    t_ptrs = TMP + offs_m
     tl.store(t_ptrs, o_scale)
     o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
@@ -231,11 +242,10 @@ def _fwd_kernel(
     start_m = tl.program_id(0)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # write back l and m
-    lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
-    tl.store(lse_ptrs, lse_i)
+    tl.store(Lse + offs_m, lse_i)
     # initialize pointers to output
     offs_d = tl.arange(0, BLOCK_HEADDIM)
-    out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :])
+    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_d[None, :])
     if EVEN_M:
         if EVEN_HEADDIM:
             tl.store(out_ptrs, acc_o)
@@ -318,19 +328,11 @@ def _bwd_kernel_one_col_block(
     EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
-    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
     # initialize row/col offsets
-    offs_qm = begin_m + tl.arange(0, BLOCK_M)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
-    # initialize pointers to value-like data
-    q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
-    dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
+
+    # load bias if loop-invariant
     if BIAS_TYPE == 'vector':
         # vector bias is same over all values of m, so
         # can be loaded once and kept in SRAM over all iterations
@@ -340,24 +342,11 @@ def _bwd_kernel_one_col_block(
         else:
             bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
         bias = bias[None, :]
-    elif BIAS_TYPE == 'matrix':
-        b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
-    # initialize dv and dk
-    dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    # There seems to be some problem with Triton pipelining that makes results wrong for
-    # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
-    # may have zero step, and pipelining with the bias matrix could screw it up.
-    # So we just exit early.
-    if begin_m >= seqlen_q:
-        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-        _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
-                         EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
-        return
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
+    k_ptrs = K + ((offs_n * stride_kn)[:, None] + offs_d[None, :])
+    v_ptrs = V + ((offs_n * stride_vn)[:, None] + offs_d[None, :])
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
             k = tl.load(k_ptrs)
@@ -374,13 +363,28 @@ def _bwd_kernel_one_col_block(
                         other=0.0)
             v = tl.load(v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                         other=0.0)
+
+    # initialize dv and dk
+    if USE_DROPOUT:
+        # accumulate dKj and dVj in half precision to save SRAM/registers.
+        # will result in slightly increased numerical error.
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DV.dtype.element_ty)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DK.dtype.element_ty)
+    else:
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+
     # loop over rows
-    num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+    # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
+    end_m = tl.cdiv(seqlen_q, BLOCK_M) * BLOCK_M
+    for start_m in range(begin_m, end_m, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
-        offs_m_curr = start_m + offs_m
+        offs_m_curr = start_m + tl.arange(0, BLOCK_M)
         # load q, k, v, do on-chip
         # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+
+        q_ptrs = Q + (offs_m_curr * stride_qm)[:, None] + offs_d[None, :]
         if EVEN_M & EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -389,18 +393,20 @@ def _bwd_kernel_one_col_block(
             else:
                 q = tl.load(q_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
                                          & (offs_d[None, :] < headdim), other=0.0)
+
         # recompute p = softmax(qk, dim=-1).T
-        qk = tl.dot(q, k, trans_b=True)
+        s = softmax_scale * tl.dot(q, k, trans_b=True)
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
+            s = tl.where(offs_n[None, :] < seqlen_k, s, float("-inf"))
         if IS_CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+            s = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), s, float("-inf"))
         if BIAS_TYPE != 'none':
             tl.debug_barrier()  # Race condition otherwise
             if BIAS_TYPE == 'vector':
                 pass  # already loaded before entering loop
             elif BIAS_TYPE == 'matrix':
+                b_ptrs = Bias + (offs_m_curr * stride_bm)[:, None] + offs_n[None, :]
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
                 else:
@@ -408,16 +414,13 @@ def _bwd_kernel_one_col_block(
                                    mask=(offs_m_curr[:, None] < seqlen_q)
                                         & (offs_n[None, :] < seqlen_k),
                                    other=0.0).to(tl.float32)
-            qk = qk * softmax_scale + bias
+            s += bias
         # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
         # Also wrong for headdim=64.
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         lse_i = tl.load(LSE + offs_m_curr)
-        if BIAS_TYPE == 'none':
-            p = tl.exp(qk * softmax_scale - lse_i[:, None])
-        else:
-            p = tl.exp(qk - lse_i[:, None])
+        p = tl.exp(s - lse_i[:, None])
 
         if USE_DROPOUT:
             # compute Zij (sort of, see below). has values:
@@ -429,39 +432,30 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
-            # don't need to materialize Zij, instead just store dropout bit mask
-            # to save SRAM. the bit mask can be used to simulate
-            # elementwise multiplication by Zij.
+            # don't need to materialize Zij, just store drop bit into sign bit of Pij
+            # (trick stolen from CUDA implementation) to save SRAM/registers
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
+            p *= tl.where(dropout_mask, 1.0, -1.0)
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
         # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
         # the output is correct.
+        do_ptrs = DO + (offs_m_curr * stride_dom)[:, None] + offs_d[None, :]
         if EVEN_M & EVEN_HEADDIM:
             do = tl.load(do_ptrs)
         else:
             # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
             do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
                                         & (offs_d[None, :] < headdim), other=0.0)
-        # if EVEN_M:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-        # else:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
-        #                                    & (offs_d[None, :] < headdim), other=0.0)
+
         if USE_DROPOUT:
-            # Pij_dropped = Pij * Zij
-            p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
-            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True)
+            p_dropped = tl.where(dropout_mask, p * (1.0 / (1.0 - dropout_p)), 0.0)
+            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
         else:
-            dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+            dv += tl.dot(p.to(do.dtype), do, trans_a=True).to(dv.dtype)
+
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
         # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
@@ -469,6 +463,9 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        # we don't need to explicitly compute dPij from dPij_dropped, see below where
+        # we compute dSij for more details.
+
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
@@ -476,16 +473,38 @@ def _bwd_kernel_one_col_block(
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster
         Di = tl.load(D + offs_m_curr)
 
-        if USE_DROPOUT:
-            # dPij = dPij_dropped * Zij
-            dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
-
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
-        ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+        if USE_DROPOUT:
+            # for computing dSij = tau * Pij * (dPij - Di)
+            # we have:
+            #   - Pij' which has negative values where Zij = 0, otherwise same as Pij
+            #   - dPij' = dPij_dropped
+            #
+            # IF KEEPING:
+            #   Pij = Pij'
+            #   dPij = dPij'
+            #
+            #   Pij * (dPij - Di) = Pij' * (dPij' - Di)
+            #                     = Pij' * ((dPij' * (1 / (1 - p))) - Di)
+            #
+            # IF DROPPING:
+            #   Pij = -Pij'
+            #   dPij = 0
+            #
+            #   Pij * (dPij - Di) = Pij * (0 - Di)
+            #                     = Pij * -Di
+            #                     = -Pij * Di
+            #                     = Pij' * Di
+            #   note earlier we flipped sign of p if element was to be dropped
+            ds = softmax_scale * p * tl.where(p > 0.0, (dp * (1.0 / (1.0 - dropout_p))) - Di[:, None], Di[:, None])
+            ds = ds.to(q.dtype)
+        else:
+            ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
         # compute dk = dot(ds.T, q)
-        dk += tl.dot(ds, q, trans_a=True)
+        dk += tl.dot(ds, q, trans_a=True).to(dk.dtype)
         # compute dq
+        dq_ptrs = DQ + (offs_m_curr * stride_dqm)[:, None] + offs_d[None, :]
         if not ATOMIC_ADD:
             if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
                 dq = tl.load(dq_ptrs, eviction_policy="evict_last")
@@ -536,15 +555,9 @@ def _bwd_kernel_one_col_block(
                 else:
                     tl.atomic_add(dq_ptrs, dq,
                                   mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
-        # increment pointers
-        dq_ptrs += BLOCK_M * stride_dqm
-        q_ptrs += BLOCK_M * stride_qm
-        do_ptrs += BLOCK_M * stride_dom
-        if BIAS_TYPE == 'matrix':
-            b_ptrs += BLOCK_M * stride_bm
     # write-back
-    dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-    dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+    dv_ptrs = DV + ((offs_n * stride_dvn)[:, None] + offs_d[None, :])
+    dk_ptrs = DK + ((offs_n * stride_dkn)[:, None] + offs_d[None, :])
     _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
                      EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
 
@@ -558,7 +571,7 @@ def init_to_zero(name):
         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         # TODO. THIS CONFIG BEING ENABLED CAUSES BUGS WHEN BLOCK_HEADDIM != 128
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
+        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
         # Other configs seem to give wrong results when seqlen_q % 128 != 0, disabling them for now
         # # Kernel is buggy (give wrong result) if we set BLOCK_m=128, BLOCK_n=64, num_warps=*4*
         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
@@ -729,7 +742,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         bias_type, causal, BLOCK_HEADDIM,
         BLOCK_M=BLOCK, BLOCK_N=BLOCK,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return o, lse, softmax_scale, rng_seed, rng_offset  # softmax_scale could have been updated
