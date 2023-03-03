@@ -195,9 +195,39 @@ class NLPDDPStrategy(DDPStrategy):
     def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> Dict[str, Any]:
         """ PTL override to accomodate model parallel checkpoints """
         # TODO: move to CheckpointIO
-        torch.cuda.empty_cache()
-        checkpoint_path = inject_model_parallel_rank(checkpoint_path)
-        return self.checkpoint_io.load_checkpoint(checkpoint_path)
+        app_state = AppState()
+
+        # Build the data-parallel groups.
+        world_size = torch.distributed.get_world_size()
+        all_data_parallel_group_ranks = []
+        pipeline_model_parallel_size = app_state.pipeline_model_parallel_size
+        num_pipeline_model_parallel_groups = world_size // pipeline_model_parallel_size
+        tensor_model_parallel_size = app_state.tensor_model_parallel_size
+        rank = torch.distributed.get_rank()
+        src = None
+
+        # Get the src rank of loading the checkpoints. 
+        for i in range(pipeline_model_parallel_size):
+            start_rank = i * num_pipeline_model_parallel_groups
+            end_rank = (i + 1) * num_pipeline_model_parallel_groups
+            for j in range(tensor_model_parallel_size):
+                ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
+                all_data_parallel_group_ranks.append(list(ranks))
+                if rank in ranks:
+                    data_parallel_group = list(ranks)
+                    src = data_parallel_group[0]
+                    logging.info(f'Rank 0 of this data parallel group contains global rank {rank} is: {src}')
+
+        checkpoints = [None]
+        print(app_state.data_parallel_rank)
+        print(app_state.data_parallel_group)
+        if app_state.data_parallel_rank == 0:
+            torch.cuda.empty_cache()
+            checkpoint_path = inject_model_parallel_rank(checkpoint_path)
+            checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
+            checkpoints = [checkpoint]
+        torch.distributed.broadcast_object_list(checkpoints, src=src, group=app_state.data_parallel_group)
+        return checkpoints[0]
 
     def remove_checkpoint(self, filepath: Union[str, Path]) -> None:
         app_state = AppState()
