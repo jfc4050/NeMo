@@ -70,6 +70,7 @@ model:
   pre_process: True # add embedding
   post_process: True # add pooler
   persist_layer_norm: True # Use of persistent fused layer norm kernel.
+  position_embedding_type: learned_absolute
 
   tokenizer:
     library: 'megatron'

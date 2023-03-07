@@ -141,6 +141,7 @@ class GPTModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
+        position_embedding_type='learned_absolute',
     ):
 
         super(GPTModel, self).__init__()
@@ -210,6 +211,7 @@ class GPTModel(MegatronModule):
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
+            position_embedding_type=position_embedding_type,
         )
 
         self.initialize_word_embeddings(
