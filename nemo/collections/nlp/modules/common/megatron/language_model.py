@@ -103,7 +103,6 @@ def get_language_model(
     fp8_amax_compute_algo='most_recent',
     reduce_amax=True,
     use_emha=False,
-    position_embedding_type='learned_absolute',
 ):
     """Build language model and return along with the key to save."""
 
@@ -152,6 +151,7 @@ def get_language_model(
         bias_dropout_add_fusion=bias_dropout_add_fusion,
         bias=bias,
         rotary_percentage=rotary_percentage,
+        attention_type=attention_type,
         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
         masked_softmax_fusion=masked_softmax_fusion,
         gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -179,7 +179,6 @@ def get_language_model(
         fp8_amax_compute_algo=fp8_amax_compute_algo,
         reduce_amax=reduce_amax,
         use_emha=use_emha,
-        position_embedding_type=position_embedding_type,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -480,7 +479,6 @@ class TransformerLanguageModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
-        position_embedding_type='learned_absolute',
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -522,7 +520,6 @@ class TransformerLanguageModel(MegatronModule):
                 sequence_parallel=sequence_parallel,
                 position_embedding_type=position_embedding_type,
                 fp32_residual_connection=fp32_residual_connection,
-                position_embedding_type=position_embedding_type,
             )
             self._embedding_key = 'embedding'
             if self.position_embedding_type == 'alibi':

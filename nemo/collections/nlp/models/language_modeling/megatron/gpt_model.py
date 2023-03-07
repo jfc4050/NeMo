@@ -151,7 +151,6 @@ class GPTModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
-        position_embedding_type='learned_absolute',
     ):
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
