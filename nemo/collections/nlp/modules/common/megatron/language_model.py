@@ -25,6 +25,9 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     init_method_normal,
     scaled_init_method_normal,
 )
+from nemo.collections.nlp.modules.common.megatron.alibi_relative_position_embedding import (
+    ALiBiRelativePositionEmbedding,
+)
 
 try:
     from apex.transformer import tensor_parallel
@@ -100,6 +103,7 @@ def get_language_model(
     fp8_amax_compute_algo='most_recent',
     reduce_amax=True,
     use_emha=False,
+    position_embedding_type='learned_absolute',
 ):
     """Build language model and return along with the key to save."""
 
@@ -175,6 +179,7 @@ def get_language_model(
         fp8_amax_compute_algo=fp8_amax_compute_algo,
         reduce_amax=reduce_amax,
         use_emha=use_emha,
+        position_embedding_type=position_embedding_type,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -475,6 +480,7 @@ class TransformerLanguageModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
+        position_embedding_type='learned_absolute',
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -494,6 +500,7 @@ class TransformerLanguageModel(MegatronModule):
         self.output_layer_init_method = output_layer_init_method
         self.position_embedding_type = position_embedding_type
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.encoder_relative_position_embedding = None
 
         if kv_channels is None:
 
@@ -515,8 +522,19 @@ class TransformerLanguageModel(MegatronModule):
                 sequence_parallel=sequence_parallel,
                 position_embedding_type=position_embedding_type,
                 fp32_residual_connection=fp32_residual_connection,
+                position_embedding_type=position_embedding_type,
             )
             self._embedding_key = 'embedding'
+            if self.position_embedding_type == 'alibi':
+                # Position embedding (alibi).
+                self.encoder_relative_position_embedding = ALiBiRelativePositionEmbedding(
+                    bidirectional=True,
+                    num_attention_heads=num_attention_heads,
+                    layer_type=LayerType.encoder,
+                    num_attention_heads_alibi=None,
+                    max_seq_len=self.max_position_embeddings,
+                )
+
 
         if position_embedding_type == 'rope':
             rotary_dim = self.hidden_size // num_attention_heads if kv_channels is None else kv_channels
@@ -669,6 +687,14 @@ class TransformerLanguageModel(MegatronModule):
         else:
             pass
 
+
+        encoder_self_attention_relative_position_bias = None
+        if self.encoder_relative_position_embedding is not None:
+            enc_seq_length = enc_input_ids.size(1)
+            encoder_self_attention_relative_position_bias = \
+                self.encoder_relative_position_embedding(query_seq_length=enc_seq_length, key_seq_length=enc_seq_length)
+
+
         # encoder_input: [s, b, h]
 
         # enc_attn_mask: [1, 1, s, s]
@@ -695,6 +721,7 @@ class TransformerLanguageModel(MegatronModule):
                 rotary_pos_emb=(rotary_pos_emb, None, None)
                 if rotary_pos_emb is not None
                 else None,  # This assumes that this being used as a GPT/BERT model only (no cross-attention)
+                self_attention_relative_position_bias=encoder_self_attention_relative_position_bias,
             )
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
