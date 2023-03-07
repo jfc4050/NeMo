@@ -528,7 +528,7 @@ class TransformerLanguageModel(MegatronModule):
             if self.position_embedding_type == 'alibi':
                 # Position embedding (alibi).
                 self.encoder_relative_position_embedding = ALiBiRelativePositionEmbedding(
-                    bidirectional=True,
+                    bidirectional=False,
                     num_attention_heads=num_attention_heads,
                     layer_type=LayerType.encoder,
                     num_attention_heads_alibi=None,
