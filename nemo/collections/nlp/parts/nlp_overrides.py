@@ -219,13 +219,12 @@ class NLPDDPStrategy(DDPStrategy):
                     logging.info(f'Rank 0 of this data parallel group contains global rank {rank} is: {src}')
 
         checkpoints = [None]
-        print(app_state.data_parallel_rank)
-        print(app_state.data_parallel_group)
         if app_state.data_parallel_rank == 0:
             torch.cuda.empty_cache()
             checkpoint_path = inject_model_parallel_rank(checkpoint_path)
             checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
             checkpoints = [checkpoint]
+            logging.info('Broadcasting checkpoints to other ranks')
         torch.distributed.broadcast_object_list(checkpoints, src=src, group=app_state.data_parallel_group)
         return checkpoints[0]
 
