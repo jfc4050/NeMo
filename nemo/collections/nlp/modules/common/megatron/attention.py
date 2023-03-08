@@ -79,7 +79,7 @@ class FlashSelfAttention(torch.nn.Module):
         self.dropout_p = attention_dropout
         self.sequence_parallel = sequence_parallel
 
-    def forward(self, q, k, v, attention_mask=None):
+    def forward(self, q, k, v, attention_mask=None, relative_position_bias=None):
         """Implements the multihead softmax attention.
         Arguments
         ---------
@@ -88,8 +88,13 @@ class FlashSelfAttention(torch.nn.Module):
         """
         if attention_mask is not None:
             attention_mask = attention_mask.view(q.shape[0], -1)
-            attention_mask = attention_mask[:, None, None, :]
-            attention_mask = attention_mask.to(q.dtype)
+            attention_mask = attention_mask.broadcast_to(q.shape[0], q.shape[2], q.shape[3], k.shape[3])
+            attention_mask = attention_mask.to(q.dtype).contiguous()
+        if relative_position_bias is not None:
+            if attention_mask is not None:
+                attention_mask += relative_position_bias
+            else:
+                attention_mask = relative_position_bias.contiguous()
         if not self.sequence_parallel:
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 output = flash_attn_func(
@@ -529,16 +534,26 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             if self.headscale or \
                 layer_past is not None or \
                 rotary_pos_emb is not None or \
-                relative_position_bias is not None:
+                self.multi_query_attention:
                 raise NotImplementedError(
-                    "headscale/layer_past/rotary_pos_emb/relative_position_bias are not implemented for triton flash attention."
+                    "headscale/layer_past/rotary_pos_emb/multi_query_attention are not implemented for triton flash attention."
                 )
+
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
+            if relative_position_bias is not None:
+                # change view to [:, ..., sq, sk]
+                relative_position_bias = relative_position_bias[
+                    :,
+                    self.num_attention_heads_partition_offset : self.num_attention_heads_partition_offset
+                    + self.num_attention_heads_per_partition,
+                    : q.size(1),
+                    : k.size(1),
+                ]
             if self.attention_type == AttnType.self_attn:
-                context_layer = self.core_attention_flash(q, k, v)
+                context_layer = self.core_attention_flash(q, k, v, relative_position_bias=relative_position_bias)
             else:
-                context_layer = self.core_attention_flash(q, k, v, attention_mask)
+                context_layer = self.core_attention_flash(q, k, v, attention_mask, relative_position_bias=relative_position_bias)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
