@@ -230,7 +230,6 @@ class GPTModel(MegatronModule):
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
-            position_embedding_type=position_embedding_type,
         )
 
         if self.share_embeddings_and_output_weights:

@@ -151,7 +151,6 @@ def get_language_model(
         bias_dropout_add_fusion=bias_dropout_add_fusion,
         bias=bias,
         rotary_percentage=rotary_percentage,
-        attention_type=attention_type,
         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
         masked_softmax_fusion=masked_softmax_fusion,
         gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -699,10 +698,8 @@ class TransformerLanguageModel(MegatronModule):
         if self.position_embedding_type == 'rope':
             if not set_inference_key_value_memory and inference_max_sequence_len is not None:
                 rotary_pos_emb = self.rotary_pos_emb(inference_max_sequence_len)
-            elif self.encoder.input_tensor is not None:
-                rotary_pos_emb = self.rotary_pos_emb(self.encoder.input_tensor.size(0))
             else:
-                rotary_pos_emb = self.rotary_pos_emb(encoder_input.size(0))
+                rotary_pos_emb = self.rotary_pos_emb(self.max_position_embeddings)
         else:
             rotary_pos_emb = None
         # encoder.
