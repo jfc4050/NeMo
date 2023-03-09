@@ -89,12 +89,12 @@ class FlashSelfAttention(torch.nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.view(q.shape[0], -1)
             attention_mask = attention_mask.broadcast_to(q.shape[0], q.shape[2], q.shape[3], k.shape[3])
-            attention_mask = attention_mask.to(q.dtype).contiguous()
+            attention_mask = attention_mask.to(q.dtype)
         if relative_position_bias is not None:
             if attention_mask is not None:
                 attention_mask += relative_position_bias
             else:
-                attention_mask = relative_position_bias.contiguous()
+                attention_mask = relative_position_bias
         if not self.sequence_parallel:
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 output = flash_attn_func(
@@ -533,11 +533,16 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         else:
             if self.headscale or \
                 layer_past is not None or \
-                rotary_pos_emb is not None or \
                 self.multi_query_attention:
                 raise NotImplementedError(
                     "headscale/layer_past/rotary_pos_emb/multi_query_attention are not implemented for triton flash attention."
                 )
+
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+
+                query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
+                key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
 
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
@@ -550,6 +555,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                     : q.size(1),
                     : k.size(1),
                 ]
+
             if self.attention_type == AttnType.self_attn:
                 context_layer = self.core_attention_flash(q, k, v, relative_position_bias=relative_position_bias)
             else:
