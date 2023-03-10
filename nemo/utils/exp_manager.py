@@ -136,6 +136,10 @@ class EMAParams:
 
 @dataclass
 class ExpManagerConfig:
+    # M*
+    check_s3: Optional[bool] = False
+    s3_region: Optional[str] = None
+    s3_bucket: Optional[str] = None
     # Log dir creation parameters
     explicit_log_dir: Optional[str] = None
     exp_dir: Optional[str] = None
@@ -323,8 +327,17 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
     )
 
     if cfg.resume_if_exists:
+        if cfg.check_s3:
+            check_resume_s3(
+                trainer,
+                cfg.s3_region,
+                cfg.s3_bucket,
+                log_dir,
+                cfg.resume_past_end,
+                cfg.resume_ignore_no_checkpoint,
+            )
         # Check for existing checkpoints in `dirpath` if it's specified, use <log_dir>/checkpoints otherwise
-        if cfg.checkpoint_callback_params.dirpath:
+        elif cfg.checkpoint_callback_params.dirpath:
             check_resume(
                 trainer,
                 log_dir,
@@ -597,6 +610,84 @@ def check_resume(
     #         new_run_dir.mkdir()
     #         for _file in files_to_move:
     #             move(str(_file), str(new_run_dir))
+
+
+def check_resume_s3(
+    trainer: 'pytorch_lightning.Trainer',
+    s3_region: str,
+    s3_bucket: str,
+    log_dir: str,
+    resume_past_end: bool = False,
+    resume_ignore_no_checkpoint: bool = False,
+):
+    """Checks that resume=True was used correctly with the arguments pass to exp_manager. Sets
+    trainer._checkpoint_connector.resume_from_checkpoint_fit_path according to S3 checkpoints.
+
+    Raises:
+        NotFoundError: If resume is True, resume_ignore_no_checkpoint is False, and checkpoints could not be found.
+        ValueError: If resume is True, and there were more than 1 checkpoint could found.
+    """
+    try:
+        import boto3
+        HAVE_BOTO3 = True
+    except (ImportError, ModuleNotFoundError):
+        HAVE_BOTO3 = False
+
+    if not HAVE_BOTO3:
+        raise ImportError(
+            "Boto3 was not found. Please either install boto3 or disable check_s3 in exp_manager"
+        )
+
+    log_dir_str = str(log_dir)
+    if not log_dir:
+        raise ValueError(f"Resuming requires the log_dir {log_dir} to be passed to exp_manager")
+    if "/mnt_out" in str(log_dir):
+        log_dir = str(log_dir).replace("/mnt_out/", "")
+    else:
+        raise ValueError(f"check_s3 is only supported in checking /mnt_out folder corresponding S3 path")
+
+    # Use s3://<log_dir>/checkpoints/
+    s3_prefix = str(Path(log_dir) / "checkpoints")
+    session = boto3.Session(region_name=s3_region)
+    s3 = session.client("s3")
+    obj = s3.list_objects(Bucket=s3_bucket, Prefix=s3_prefix)
+    checkpoint = None
+    end_checkpoints = [x['Key'] for x in obj['Contents'] if x['Key'].endswith('end.ckpt')] if 'Contents' in obj else []
+    last_checkpoints = [x['Key'] for x in obj['Contents'] if x['Key'].endswith('last.ckpt')] if 'Contents' in obj else []
+
+    # TODO: Add check for all the files for each data parallel group are the same. 
+
+    if len(end_checkpoints) == 0 and len(last_checkpoints) == 0:
+        if resume_ignore_no_checkpoint:
+            logging.warning(
+                f"There was no checkpoint folder at checkpoint_dir :{log_dir_str}. Training from scratch."
+            )
+            return
+        else:
+            raise NotFoundError(f"There was no checkpoint folder at checkpoint_dir :{log_dir_str}. Cannot resume.")
+    elif len(end_checkpoints) > 0:
+        if resume_past_end:
+            if len(end_checkpoints) > 1:
+                if 'mp_rank' in str(end_checkpoints[0]):
+                    checkpoint = end_checkpoints[0]
+                else:
+                    raise ValueError(f"Multiple checkpoints {end_checkpoints} that matches *end.ckpt.")
+            logging.info(f"Resuming from {end_checkpoints[0]}")
+        else:
+            raise ValueError(
+                f"Found {end_checkpoints[0]} indicating that the last training run has already completed."
+            )
+    elif len(last_checkpoints) > 1:
+        if 'mp_rank' in str(last_checkpoints[0]) or 'tp_rank' in str(last_checkpoints[0]):
+            checkpoint = last_checkpoints[0]
+            checkpoint = uninject_model_parallel_rank(checkpoint)
+        else:
+            raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
+    else:
+        logging.info(f"Resuming from {last_checkpoints[0]}")
+        checkpoint = last_checkpoints[0]
+
+    trainer._checkpoint_connector.resume_from_checkpoint_fit_path = str(Path('/mnt_out') / checkpoint)
 
 
 def check_explicit_log_dir(
