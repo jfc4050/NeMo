@@ -642,6 +642,7 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
         self.attention_dropout = attention_dropout
         self.bias_dropout_add_fusion = bias_dropout_add_fusion  # if true, enable bias dropout fusion
 
+        self.megatron_legacy = megatron_legacy
         self.projection_size = kv_channels * num_attention_heads
         self.ffn_hidden_size = ffn_hidden_size
         self.world_size = parallel_state.get_tensor_model_parallel_world_size()
