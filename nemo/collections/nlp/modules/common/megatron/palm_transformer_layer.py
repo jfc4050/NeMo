@@ -267,7 +267,6 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
         query_layer,
         key_layer,
         value_layer,
-        hidden_states,
         attention_mask,
         layer_past=None,
         get_key_value=False,
@@ -286,10 +285,10 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
         if set_inference_key_value_memory:
             assert inference_max_sequence_len and inference_max_sequence_len > 0
             self.inference_key_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype
+                inference_max_sequence_len, key_layer.size(1), key_layer.dtype
             )
             self.inference_value_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype
+                inference_max_sequence_len, value_layer.size(1), value_layer.dtype
             )
             self.inference_current_sequence_len = 0
 
