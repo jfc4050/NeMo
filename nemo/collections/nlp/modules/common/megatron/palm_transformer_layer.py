@@ -9,16 +9,35 @@ import torch.nn.functional as F
 from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import AdapterName, InfusedAdapterConfig, MLPInfusedAdapterConfig, ParallelLinearAdapterConfig
 from nemo.collections.nlp.modules.common.megatron.attention import CoreAttention, FlashSelfAttention, ParallelChunkedCrossAttention
-from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import bias_dropout_add_fused_inference, bias_dropout_add_fused_train
+from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import (
+    bias_dropout_add,
+    bias_dropout_add_fused_inference,
+    bias_dropout_add_fused_train,
+    dropout_add,
+)
 from nemo.collections.nlp.modules.common.megatron.fused_layer_norm import get_layer_norm
 from nemo.collections.nlp.modules.common.megatron.layer_norm_1p import LayerNorm1P
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.mlp import SwitchMLP
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import apply_rotary_pos_emb
-from nemo.collections.nlp.modules.common.megatron.transformer import get_bias_dropout_add, get_dropout_add
 from nemo.collections.nlp.modules.common.megatron.utils import erf_gelu, openai_gelu as openai_gelu_func, squared_relu
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
+
+
+def get_bias_dropout_add(training):
+    def _bias_dropout_add(x, bias, residual, prob):
+        return bias_dropout_add(x, bias, residual, prob, training)
+
+    return _bias_dropout_add
+
+
+def get_dropout_add(training):
+    def _dropout_add(x, bias, residual, prob):
+        assert bias is None
+        return dropout_add(x, bias, residual, prob, training)
+
+    return _dropout_add
 
 
 class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
