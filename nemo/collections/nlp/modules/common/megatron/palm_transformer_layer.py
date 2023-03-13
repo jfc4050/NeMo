@@ -15,7 +15,7 @@ from nemo.collections.nlp.modules.common.megatron.fused_bias_gelu import fused_b
 from nemo.collections.nlp.modules.common.megatron.fused_layer_norm import get_layer_norm
 from nemo.collections.nlp.modules.common.megatron.layer_norm_1p import LayerNorm1P
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
-from nemo.collections.nlp.modules.common.megatron.mlp import ParallelMLP, SwitchMLP
+from nemo.collections.nlp.modules.common.megatron.mlp import SwitchMLP
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import apply_rotary_pos_emb
 from nemo.collections.nlp.modules.common.megatron.transformer import get_bias_dropout_add, get_dropout_add
@@ -23,7 +23,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import erf_gelu, openai_
 from nemo.core.classes.mixins.adapter_mixins import AdapterModuleMixin
 
 
-class ParallelAttention(MegatronModule, AdapterModuleMixin):
+class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
     """Parallel self-attention layer abstract class.
 
     Self-attention layer takes input with size [s, b, h]
@@ -57,7 +57,7 @@ class ParallelAttention(MegatronModule, AdapterModuleMixin):
         normalize_attention_scores=True,
         use_flash_attention=True,
     ):
-        super(ParallelAttention, self).__init__()
+        super(PalmParallelAttention, self).__init__()
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
@@ -487,7 +487,7 @@ class ParallelAttention(MegatronModule, AdapterModuleMixin):
 
 
 
-class ParallelMLP(MegatronModule, AdapterModuleMixin):
+class PalmParallelMLP(MegatronModule, AdapterModuleMixin):
     """MLP.
 
     MLP will take the input with h hidden state, project it to 4*h
@@ -515,7 +515,7 @@ class ParallelMLP(MegatronModule, AdapterModuleMixin):
         gradient_accumulation_fusion=False,
         dropout=0.0,
     ):
-        super(ParallelMLP, self).__init__()
+        super(PalmParallelMLP, self).__init__()
         self.activation = activation
         self.bias = bias
         self.transformer_block_type = transformer_block_type
@@ -678,7 +678,7 @@ class ParallelMLP(MegatronModule, AdapterModuleMixin):
 
 
 
-class ParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
+class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -728,7 +728,7 @@ class ParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
         moe_frequency=1,
         moe_dropout=0.0,
     ):
-        super(ParallelTransformerLayer_, self).__init__()
+        super(PalmParallelTransformerLayer_, self).__init__()
 
         if kv_channels is None:
             assert (
@@ -776,7 +776,7 @@ class ParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
             else:
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
-            self.self_attention = ParallelAttention(
+            self.self_attention = PalmParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
                 layer_number=layer_number,
@@ -845,7 +845,7 @@ class ParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
                 self.post_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
         if self.layer_type == LayerType.decoder or self.layer_type == LayerType.retrieval_encoder:
-            self.inter_attention = ParallelAttention(
+            self.inter_attention = PalmParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
                 layer_number=layer_number,
@@ -962,7 +962,7 @@ class ParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
                 dropout=moe_dropout,
             )
         else:
-            self.mlp = ParallelMLP(
+            self.mlp = PalmParallelMLP(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
                 hidden_size=hidden_size,
