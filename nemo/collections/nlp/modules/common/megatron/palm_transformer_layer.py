@@ -10,8 +10,6 @@ from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import AdapterName, InfusedAdapterConfig, MLPInfusedAdapterConfig, ParallelLinearAdapterConfig
 from nemo.collections.nlp.modules.common.megatron.attention import CoreAttention, FlashSelfAttention, ParallelChunkedCrossAttention
 from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import bias_dropout_add_fused_inference, bias_dropout_add_fused_train
-from nemo.collections.nlp.modules.common.megatron.fused_bias_geglu import fused_bias_geglu
-from nemo.collections.nlp.modules.common.megatron.fused_bias_gelu import fused_bias_gelu
 from nemo.collections.nlp.modules.common.megatron.fused_layer_norm import get_layer_norm
 from nemo.collections.nlp.modules.common.megatron.layer_norm_1p import LayerNorm1P
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
@@ -454,40 +452,9 @@ class PalmParallelMLP(MegatronModule, AdapterModuleMixin):
                 f"Activation {activation} not supported. Only gelu, geglu, reglu, swiglu, squared-relu are supported."
             )
 
-        no_async_tensor_model_parallel_allreduce = (
-            parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
-        )
-        # Project to 4h.
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            hidden_size,
-            ffn_hidden_size,  # NOTE: When using geglu, divide ffn dim by 2/3 to keep overall params the same.
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            use_cpu_initialization=use_cpu_initialization,
-            bias=bias,
-            sequence_parallel_enabled=sequence_parallel,
-            no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-        )
-
-        if activation in ['geglu', 'reglu', 'swiglu']:
-            # Separate linear layer for *GLU activations.
-            # Source: https://github.com/huggingface/transformers/blob/bee361c6f1f7704f8c688895f2f86f6e5ff84727/src/transformers/models/t5/modeling_t5.py#L292
-            self.dense_h_to_4h_2 = tensor_parallel.ColumnParallelLinear(
-                hidden_size,
-                ffn_hidden_size,  # NOTE: When using *glu, divide ffn dim by 2/3 to keep overall params the same.
-                gather_output=False,
-                init_method=init_method,
-                skip_bias_add=True,
-                use_cpu_initialization=use_cpu_initialization,
-                bias=bias,
-                sequence_parallel_enabled=sequence_parallel,
-                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-            )
-
         self.glu_activation_family = activation in ['geglu', 'reglu', 'swiglu']
+        assert not self.glu_activation_family
+
         bias_activation_fusion_unavailable = activation in ['reglu', 'swiglu']
 
         if bias_activation_fusion_unavailable and bias_activation_fusion:
@@ -552,37 +519,9 @@ class PalmParallelMLP(MegatronModule, AdapterModuleMixin):
                     ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon
                 )
 
-    def forward(self, hidden_states):
-
-        # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
-
-        if self.glu_activation_family:
-            intermediate_parallel_2, bias_parallel_2 = self.dense_h_to_4h_2(hidden_states)
-
-        if self.bias_activation_fusion:
-            if self.activation == 'gelu':
-                intermediate_parallel = fused_bias_gelu(intermediate_parallel, bias_parallel)
-            elif self.activation == 'geglu':
-                intermediate_parallel = fused_bias_geglu(
-                    intermediate_parallel, bias_parallel, intermediate_parallel_2, bias_parallel_2
-                )
-
-        elif self.activation in ['reglu', 'swiglu'] or (
-            self.glu_activation_family and not self.bias_activation_fusion
-        ):
-            if bias_parallel is not None:
-                intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel) * (
-                    intermediate_parallel_2 + bias_parallel_2
-                )
-            else:
-                intermediate_parallel = self.activation_func(intermediate_parallel) * intermediate_parallel_2
-
-        else:
-            if bias_parallel is not None:
-                intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel)
-            else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+    def forward(self, intermediate_parallel):
+        # intermediate_parallel: [s, b, 4hp]
+        intermediate_parallel = self.activation_func(intermediate_parallel)
 
         if self.dropout > 0:
             intermediate_parallel = F.dropout(intermediate_parallel, p=self.dropout, training=self.training)
@@ -709,11 +648,15 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
             # modified from ParallelAttention::query_key_value
+            # note that normally QKV doesn't skip bias add, while FF1 does.
+            # we opt to add the bias here, this means that in MLP layers activation
+            # isn't fused with bias-add.
             self.qkv_ff_projection_self = tensor_parallel.ColumnParallelLinear(
                 hidden_size,
                 3 * self.projection_size + self.ffn_hidden_size,
                 gather_output=False,
                 init_method=init_method,
+                # skip_bias_add=True,
                 use_cpu_initialization=use_cpu_initialization,
                 bias=bias,
                 sequence_parallel_enabled=sequence_parallel,
@@ -1126,7 +1069,7 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
             if self.transformer_block_type == 'post_ln':
                 layernorm_input = normalization_output
         # MLP.
-        mlp_output, mlp_bias = self.mlp(normalization_output)
+        mlp_output, mlp_bias = self.mlp(ff1)
         if (
             self.is_adapter_available()
         ):  # TODO: (@adithyre) was able to move adapter_2 back to the end of the transformer after ptl 1.7 update.
