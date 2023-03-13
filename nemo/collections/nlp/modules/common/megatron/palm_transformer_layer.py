@@ -58,6 +58,7 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
         use_flash_attention=True,
     ):
         super(PalmParallelAttention, self).__init__()
+        assert attention_type == AttnType.self_attn
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
@@ -88,47 +89,6 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
         self.num_attention_heads_partition_offset = (
             self.num_attention_heads_per_partition * parallel_state.get_tensor_model_parallel_rank()
         )
-
-        no_async_tensor_model_parallel_allreduce = (
-            parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
-        )
-
-        # Strided linear layer.
-        if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                hidden_size,
-                3 * projection_size,
-                gather_output=False,
-                init_method=init_method,
-                use_cpu_initialization=use_cpu_initialization,
-                bias=bias,
-                sequence_parallel_enabled=sequence_parallel,
-                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-            )
-        else:
-            assert attention_type == AttnType.cross_attn
-            self.query = tensor_parallel.ColumnParallelLinear(
-                hidden_size,
-                projection_size,
-                gather_output=False,
-                init_method=init_method,
-                bias=bias,
-                sequence_parallel_enabled=sequence_parallel,
-                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-            )
-
-            self.key_value = tensor_parallel.ColumnParallelLinear(
-                hidden_size,
-                2 * projection_size,
-                gather_output=False,
-                init_method=init_method,
-                bias=bias,
-                sequence_parallel_enabled=sequence_parallel,
-                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-            )
 
         self.core_attention = CoreAttention(
             layer_number=self.layer_number,
@@ -287,6 +247,9 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
 
     def forward(
         self,
+        query_layer,
+        key_layer,
+        value_layer,
         hidden_states,
         attention_mask,
         layer_past=None,
@@ -327,46 +290,6 @@ class PalmParallelAttention(MegatronModule, AdapterModuleMixin):
         # =====================
         # Query, Key, and Value
         # =====================
-
-        if self.attention_type == AttnType.self_attn:
-            # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states)
-
-            # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-            new_tensor_shape = mixed_x_layer.size()[:-1] + (
-                self.num_attention_heads_per_partition,
-                3 * self.hidden_size_per_attention_head,
-            )
-            if self.megatron_legacy:
-                mixed_x_layer = self._transpose_last_dim(mixed_x_layer, 3, True)
-            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
-
-            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-            (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
-        else:
-            # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-            mixed_kv_layer, _ = self.key_value(encoder_output)
-
-            # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
-            new_tensor_shape = mixed_kv_layer.size()[:-1] + (
-                self.num_attention_heads_per_partition,
-                2 * self.hidden_size_per_attention_head,
-            )
-            if self.megatron_legacy:
-                mixed_kv_layer = self._transpose_last_dim(mixed_kv_layer, 2, True)
-            mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
-
-            # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-            (key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
-
-            # Attention head [sq, b, h] --> [sq, b, hp]
-            query_layer, _ = self.query(hidden_states)
-            # [sq, b, hp] --> [sq, b, np, hn]
-            new_tensor_shape = query_layer.size()[:-1] + (
-                self.num_attention_heads_per_partition,
-                self.hidden_size_per_attention_head,
-            )
-            query_layer = query_layer.view(*new_tensor_shape)
 
         if self.is_adapter_available():
             key_infused_adapter = self.get_adapter_module(AdapterName.KEY_INFUSED)
@@ -761,6 +684,15 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
         self.attention_dropout = attention_dropout
         self.bias_dropout_add_fusion = bias_dropout_add_fusion  # if true, enable bias dropout fusion
 
+        self.projection_size = kv_channels * num_attention_heads
+        self.ffn_hidden_size = ffn_hidden_size
+        self.world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.hidden_size_per_attention_head = safe_divide(self.projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = safe_divide(num_attention_heads, self.world_size)
+        no_async_tensor_model_parallel_allreduce = (
+            parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
+        )
+
         # Self attention.
         # retrieval_decoder_after_self_attn skips the self attention
         if self.layer_type != LayerType.retrieval_decoder_after_self_attn:
@@ -775,6 +707,19 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
                 )
             else:
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
+
+            # modified from ParallelAttention::query_key_value
+            self.qkv_ff_projection_self = tensor_parallel.ColumnParallelLinear(
+                hidden_size,
+                3 * self.projection_size + self.ffn_hidden_size,
+                gather_output=False,
+                init_method=init_method,
+                use_cpu_initialization=use_cpu_initialization,
+                bias=bias,
+                sequence_parallel_enabled=sequence_parallel,
+                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+            )
 
             self.self_attention = PalmParallelAttention(
                 init_method=init_method,
@@ -1042,8 +987,33 @@ class PalmParallelTransformerLayer_(MegatronModule, AdapterModuleMixin):
             if self.transformer_block_type in ['pre_ln', 'normformer']:
                 hidden_states = self.input_layernorm(hidden_states)
 
+            # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+            mixed_x_layer, _ = self.qkv_ff_projection_self(hidden_states)
+            mixed_x_layer_qkv, ff1 = torch.split(
+                mixed_x_layer,
+                [
+                    safe_divide(3 * self.projection_size, self.world_size),
+                    safe_divide(self.ffn_hidden_size, self.world_size)
+                ],
+                dim=-1
+            )
+
+            # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+            new_tensor_shape = mixed_x_layer_qkv.size()[:-1] + (
+                self.num_attention_heads_per_partition,
+                3 * self.hidden_size_per_attention_head,
+            )
+            if self.megatron_legacy:
+                mixed_x_layer_qkv = self._transpose_last_dim(mixed_x_layer_qkv, 3, True)
+            mixed_x_layer_qkv = mixed_x_layer_qkv.view(*new_tensor_shape)
+
+            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+            (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer_qkv, 3)
+
             attention_output, attention_bias = self.self_attention(
-                hidden_states,
+                query_layer,
+                key_layer,
+                value_layer,
                 attention_mask,
                 layer_past=layer_past,
                 get_key_value=get_key_value,
